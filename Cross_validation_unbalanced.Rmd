@@ -1,0 +1,186 @@
+---
+title: "Cross_vali_unbalanced"
+Author: "Gustav Aarup Lauridsen"
+Date: "30/11-2020"
+output: html_document
+---
+```{r}
+library(pacman)
+p_load(groupdata2,tidyverse,randomForest, Sentida, caret, reshape2)
+data <- read.csv("constructive_dataset.csv")
+
+data$binary <- as.factor(data$binary)
+data <- groupdata2::fold(data, k = 5,
+                 cat_col = "binary")
+```
+
+```{r}
+c <- data
+c$text1 <- ""
+c$text2 <- ""
+c$text3 <- ""
+c$full_text <- as.character(c$full_text)
+for(i in 1:nrow(c)){
+  text <- strsplit(as.character(c$full_text[i]), " ")[[1]]
+  lns <- round(sapply(strsplit(c$full_text[i], " "), length)/3, 0)
+  c$text1[i] <- paste(text[1:lns],collapse=" ")
+  c$text2[i] <- paste(text[(lns):(lns*2)],collapse=" ")
+  c$text3[i] <- paste(text[(lns*2):length(text)],collapse=" ")
+}
+
+data_long <- gather(c, text_n, full_text, text1:text3, factor_key=TRUE)
+data_long$const_words <- as.numeric(unlist(lapply(data_long$full_text,constructive_counter, "mean")[]))
+data_long$senti <- as.numeric(unlist(lapply(data_long$full_text,sentida, "mean")[]))
+
+data_long <- select(data_long, c(full_text, binary, senti, const_words, constructive,topic, row, .folds))
+```
+
+```{r}
+#Column names for result df
+coln <- c("Accuracy","Kappa","AccuracyLower","AccuracyUpper","AccuracyNull","AccuracyPValue","McnemarPValue","Sensitivity","Specificity","Pos Pred Value","Neg Pred Value","Precision","Recall","F1","Prevalence","Detection Rate",
+          "Detection Prevalence","Balanced Accuracy")
+
+#words and characters the randomForest function cant handle
+bad_rf <- c(")", "(", ",", "?", "for", "in", ".","!", "<", ">", "+", "-", "'", "_")
+bad_rf <- c(bad_rf, paste(bad_rf, "_prev", sep=""))
+```
+
+#Creating empty lists and data frame for storing results
+```{r}
+#Dataframes for performance metrics
+rf_df <- as.data.frame(matrix(0, ncol = 18))
+names(rf_df) <- coln
+
+#Empty lists for all predictions                         
+preds_index <- list()
+
+#Empty list for importance df
+importance_df <- list()
+
+#Empty lists for confusion matrices
+rf_res <- list()
+```
+
+```{r}
+folds <- levels(as.factor(data_long$.folds))
+
+for(n in folds){
+  train.data <- data_long[!data_long$.folds ==n,]
+  test.data <- data_long[data_long$.folds==n,]
+  
+  ###test.data Cleaning and making DTM
+  test.data$full_text <- str_remove_all(test.data$full_text, "[:punct:]")
+  test.data$full_text <- gsub("\\d+", "NUMB", test.data$full_text)
+  corp_t <- corpus(test.data$full_text)
+  dtm_t <- dfm(corp_t)
+  dtm_t <- dfm_trim(dtm_t, min_termfreq = round(0.05*nrow(test.data)),
+                  max_termfreq = round(0.95*nrow(test.data)), verbose = TRUE)
+  dtm_t <- convert(dtm_t, to="tm")
+  dtm_df_t <- as.data.frame(as.matrix(dtm_t))
+  dtm_df_t$binary <- as.factor(test.data$binary)
+  dtm_df_t$senti <- test.data$senti
+  dtm_df_t$const_words <- test.data$const_words
+  dtm_df_t$topic <- test.data$topic
+
+  ###train.data Cleaning and making DTM
+  wr <- make_word_ratios(train.data)
+  for(i in 1:nrow(train.data)){
+    ys_freq <- data.frame(ft=as.character(train.data$full_text[i])) %>% 
+      mutate(sentence= tolower(ft)) %>% 
+      mutate(sentence = str_remove_all(sentence, "[:digit:]")) %>% 
+      mutate(sentence = gsub(" ?(f|ht)tp(s?)://(.*)[.][a-z]+", "", sentence)) %>%
+      mutate(sentence = str_remove(sentence, "www.* "))
+    
+    ys_freq$sentence <- rem_stop(ys_freq$sentence)
+    
+    tidy_ys<-tidytext::unnest_tokens(tbl=ys_freq,output=word, sentence, token = "words", collapse=F)
+    
+    tidy_ys <- left_join(tidy_ys, wr, by="word")
+    train.data$logratio[i] <- sum(tidy_ys$logratio, na.rm=T)
+    train.data$logratio_mean[i] <- mean(tidy_ys$logratio, na.rm=T)
+  }
+  
+  ###Adding logratio to test.data
+  for(i in 1:nrow(test.data)){
+    ys_freq <- data.frame(ft=as.character(test.data$full_text[i])) %>% 
+      mutate(sentence= tolower(ft)) %>% 
+      mutate(sentence = str_remove_all(sentence, "[:digit:]")) %>% 
+      mutate(sentence = gsub(" ?(f|ht)tp(s?)://(.*)[.][a-z]+", "", sentence)) %>%
+      mutate(sentence = str_remove(sentence, "www.* "))
+    
+    ys_freq$sentence <- rem_stop(ys_freq$sentence)
+    
+    tidy_ys<-tidytext::unnest_tokens(tbl=ys_freq,output=word, sentence, token = "words", collapse=F)
+    
+    tidy_ys <- left_join(tidy_ys, wr, by="word")
+    test.data$logratio[i] <- sum(tidy_ys$logratio, na.rm=T)
+    test.data$logratio_mean[i] <- mean(tidy_ys$logratio, na.rm=T)
+  }
+  
+  dtm_df_t$logratio <- test.data$logratio
+  dtm_df_t$logratio_mean <- test.data$logratio_mean
+  
+  ###Creating train.data DTM
+  corp <- corpus(train.data$full_text)
+  dtm <- dfm(corp)
+  dtm <- dfm_trim(dtm, min_termfreq = round(0.05*nrow(train.data)),
+                  max_termfreq = round(0.95*nrow(train.data)), verbose = TRUE)
+  dtm_df <- as.data.frame(as.matrix(dtm))
+  dtm_df <- dtm_df[,names(dtm_df) %in% names(dtm_df_t)]
+  dtm_df$binary <- as.factor(train.data$binary)
+  dtm_df$senti <- train.data$senti
+  dtm_df$const_words <- train.data$const_words
+  dtm_df$logratio <- train.data$logratio
+  dtm_df$logratio_mean <- train.data$logratio_mean
+  dtm_df$topic <- train.data$topic
+  
+  
+    #Remove all columns random forest cant handle
+  if(length(which(names(dtm_df) %in% bad_rf)) !=0){
+    dtm_df <- dtm_df[,-which(names(dtm_df) %in% bad_rf)]
+  }
+  
+  print(paste("Making random forest number", as.numeric(n), sep=": "))
+  #Running Random Forest classification
+  rf <- randomForest(formula = as.factor(binary)~., 
+                data = dtm_df, importance=TRUE,proximity=F) 
+
+  test.data$preds <- predict(rf, dtm_df_t)
+  test.data$binary <- as.numeric(as.character(test.data$binary))
+  test.data$preds <- as.numeric(as.character(test.data$preds))
+
+  predios <- aggregate(as.numeric(test.data$preds), by=list(test.data$row), FUN=sum)
+  binarios <- aggregate(as.numeric(test.data$binary), by=list(test.data$row), FUN=sum)
+  
+  names(binarios)[2] <- "binary"
+  resis <- left_join(predios,binarios)
+  names(resis)[2] <-"preds" 
+  
+  resis$preds <- ifelse(resis$preds>0,1,0)
+  resis$binary <- ifelse(resis$binary==3,1,0)
+
+  resis$preds <- factor(resis$preds, levels = c("1","0"))
+  resis$binary <- factor(resis$binary, levels = c("1","0"))
+
+  cfm_rf <- confusionMatrix(
+  resis$pred,
+  resis$binary,
+  positive = NULL,
+  dnn = c("final", "binary"),
+  prevalence = NULL,
+  mode = "sens_spec"
+  )
+  
+  #Saving performance metrics
+  rf_df <- rbind(rf_df,c(cfm_rf$overall,cfm_rf$byClass))
+
+  #Saving importance df
+  importance_df[[n]] <- as.data.frame(round(randomForest::importance(rf), 2))
+
+  #saving confusion matrices
+  rf_res[[n]] <- cfm_rf$table
+}
+
+save(rf_df, importance_df, rf_res, file = "Results_cnmirror_unbalanced.rda")
+```
+
